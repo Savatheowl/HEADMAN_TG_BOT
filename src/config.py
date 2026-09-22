@@ -45,7 +45,7 @@ class Config:
     DEFAULTS: dict[str, Any] = {
         "DATABASE_PATH": str(BASE_DIR / "data" / "bot.db"),
         "LOG_LEVEL": "INFO",
-        "UPDATE_INTERVAL_MINUTES": 30,
+        "UPDATE_INTERVAL_MINUTES": 60,
         "DOWNLOAD_DIR": str(BASE_DIR / "downloads"),
         "CACHE_TTL_SECONDS": 3600,
     }
@@ -138,6 +138,9 @@ class Config:
 
     def cache_ttl_seconds(self) -> int:
         return self.get_int("CACHE_TTL_SECONDS", self.DEFAULTS["CACHE_TTL_SECONDS"])
+
+    def week_parity_flip(self) -> bool:
+        return self.get_bool("WEEK_PARITY_FLIP", False)
 
 
 if __name__ == "__main__":

@@ -8,15 +8,23 @@ from pathlib import Path
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNotFound,
+    TelegramRetryAfter,
+)
 from aiogram.filters import CommandStart
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.config import Config  # noqa: E402
-from src.database import Database  # noqa: E402
+from src.database import Database, UserRole, parse_course_from_filename  # noqa: E402
 from src.downloader import run_downloader  # noqa: E402
 from src.parser import parse_schedule_files  # noqa: E402
 
@@ -54,7 +62,24 @@ CONFIRM_PREFIX = "confirm:"
 CANCEL_PREFIX = "cancel:"
 BACK_TO_COURSES = "back:courses"
 
+SG_BACK = "sgback:courses"
+SG_COURSE_PREFIX = "sgcourse:"
+SG_GROUP_PREFIX = "sggroup:"
+SG_CONFIRM_PREFIX = "sgconfirm:"
+SG_CANCEL_PREFIX = "sgcancel:"
+
+V_BACK = "vback:courses"
+V_COURSE_PREFIX = "vcourse:"
+V_GROUP_PREFIX = "vgroup:"
+
 NO_SCHEDULE_TEXT = "⚠️ В базе пока нет расписания. Попробуйте позже."
+
+NOTIFY_COURSE_UPDATE = (
+    "📢 <b>Новая версия расписания!</b>\n\n"
+    "Для <b>{course}-го курса</b> обновилось расписание.{groups_part}\n"
+    "Проверь, не изменилось ли что-то у твоей группы: "
+    "нажми /start и открой «Сегодня»."
+)
 
 WEEK_EMOJI = {"в": "⬛", "н": "⬜"}
 WEEK_LABELS = {"в": "ВЕРХНЯЯ", "н": "НИЖНЯЯ"}
@@ -79,27 +104,80 @@ DAY_NAMES = [
 WEEK_DAYS = list(DAY_SHORT)
 
 MENU_SCHEDULE = "menu:schedule"
+MENU_TODAY = "menu:today"
+MENU_TOMORROW = "menu:tomorrow"
 MENU_DAY = "menu:day"
 MENU_TOGGLE = "menu:toggle"
+MENU_WEEK = "menu:week"
 MENU_HOME = "menu:home"
+MENU_SETTINGS = "menu:settings"
+MENU_FOREIGN = "menu:foreign"
+MENU_PDF = "menu:pdf"
+MENU_ANNOUNCE = "menu:announce"
+MENU_ADMIN = "menu:admin"
+
+SETTINGS_GROUP = "settings:group"
+
+ADMIN_STATS = "admin:stats"
+ADMIN_BROADCAST = "admin:broadcast"
+ADMIN_ROLES = "admin:roles"
+ADMIN_UPDATE = "admin:update"
+ADMIN_BACK = "admin:back"
+
+ADMIN_ROLE_PICK_PREFIX = "admin:role:pick:"
+ADMIN_ROLE_SET_PREFIX = "admin:role:set:"
+
+BROADCAST_AUD_PREFIX = "admin:bcast:aud:"
+BROADCAST_CONFIRM = "admin:bcast:ok"
+BROADCAST_REDO = "admin:bcast:redo"
+BROADCAST_CANCEL = "admin:bcast:cancel"
+
+ANNOUNCE_AUD_PREFIX = "announce:aud:"
+ANNOUNCE_CONFIRM = "announce:ok"
+ANNOUNCE_REDO = "announce:redo"
+ANNOUNCE_CANCEL = "announce:cancel"
 
 
-def courses_keyboard() -> InlineKeyboardMarkup:
+class BroadcastStates(StatesGroup):
+    """FSM ввода текста рассылки админа."""
+
+    text = State()
+
+
+class AnnounceStates(StatesGroup):
+    """FSM ввода текста объявления старосты."""
+
+    text = State()
+
+
+class RoleStates(StatesGroup):
+    """FSM поиска пользователя для выдачи роли."""
+
+    query = State()
+
+
+def courses_keyboard(
+    prefix: str = COURSE_PREFIX, back: str | None = None
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for course in db.list_courses():
-        builder.button(text=f"{course} курс", callback_data=f"{COURSE_PREFIX}{course}")
+        builder.button(text=f"{course} курс", callback_data=f"{prefix}{course}")
+    if back:
+        builder.button(text="← Назад", callback_data=back)
     builder.adjust(2)
     return builder.as_markup()
 
 
-def groups_keyboard(course: int) -> InlineKeyboardMarkup | None:
+def groups_keyboard(
+    course: int, prefix: str = GROUP_PREFIX, back: str = BACK_TO_COURSES
+) -> InlineKeyboardMarkup | None:
     groups = db.list_groups_by_course(course)
     if not groups:
         return None
     builder = InlineKeyboardBuilder()
     for group in groups:
-        builder.button(text=group, callback_data=f"{GROUP_PREFIX}{group}")
-    builder.button(text="← Назад", callback_data=BACK_TO_COURSES)
+        builder.button(text=group, callback_data=f"{prefix}{group}")
+    builder.button(text="← Назад", callback_data=back)
     builder.adjust(2)
     return builder.as_markup()
 
@@ -109,6 +187,15 @@ def confirm_keyboard(course: int, group: str) -> InlineKeyboardMarkup:
     builder.button(text="✅ Подтвердить", callback_data=f"{CONFIRM_PREFIX}{group}")
     builder.button(text="❌ Отмена", callback_data=f"{CANCEL_PREFIX}{course}")
     builder.button(text="← Назад", callback_data=BACK_TO_COURSES)
+    builder.adjust(1, 2)
+    return builder.as_markup()
+
+
+def sg_confirm_keyboard(course: int, group: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Изменить", callback_data=f"{SG_CONFIRM_PREFIX}{group}")
+    builder.button(text="❌ Отмена", callback_data=f"{SG_CANCEL_PREFIX}{course}")
+    builder.button(text="← Назад", callback_data=SG_BACK)
     builder.adjust(1, 2)
     return builder.as_markup()
 
@@ -140,16 +227,34 @@ def _view_reference_date(now: datetime | None = None) -> datetime:
     return now + timedelta(days=1) if now.weekday() == 6 else now
 
 
+def view_day(now: datetime | None = None, days_offset: int = 0) -> tuple[str, str]:
+    """(week, day) для панели на дату now + days_offset.
+
+    Воскресенье (включая воскресенье, получившееся сдвигом) предстаёт
+    понедельником следующей недели — так сб + 1 день ведёт сразу на ПН,
+    а вс + 1 день — на ПН (как и само воскресенье).
+    """
+    target = (now or datetime.now()) + timedelta(days=days_offset)
+    if target.weekday() == 6:
+        target += timedelta(days=1)
+    return week_for_date(target), DAY_NAMES[target.weekday()]
+
+
+def week_for_date(target: datetime) -> str:
+    """Неделя целевой даты: чётная ISO-неделя года = верхняя, нечётная = нижняя."""
+    iso_week = target.isocalendar()[1]
+    week = "в" if iso_week % 2 == 0 else "н"
+    if Config().week_parity_flip():
+        week = "н" if week == "в" else "в"
+    return week
+
+
 def current_week(now: datetime | None = None) -> str:
     """Текущая неделя: чётная ISO-неделя года = верхняя ('в'), нечётная = нижняя ('н').
 
     В воскресенье — неделя следующего понедельника.
     """
-    iso_week = _view_reference_date(now).isocalendar()[1]
-    week = "в" if iso_week % 2 == 0 else "н"
-    if Config().week_parity_flip():
-        week = "н" if week == "в" else "в"
-    return week
+    return view_day(now, 0)[0]
 
 
 def current_day(now: datetime | None = None) -> str:
@@ -157,7 +262,7 @@ def current_day(now: datetime | None = None) -> str:
 
     В воскресенье возвращается ПОНЕДЕЛЬНИК следующей недели.
     """
-    return DAY_NAMES[_view_reference_date(now).weekday()]
+    return view_day(now, 0)[1]
 
 
 def main_menu_text(group: str, registered: bool = False) -> str:
@@ -166,9 +271,61 @@ def main_menu_text(group: str, registered: bool = False) -> str:
     return f"📋 <b>Главное меню</b>\nГруппа: <b>{escape(group)}</b>"
 
 
-def main_menu_markup() -> InlineKeyboardMarkup:
+def main_menu_markup(
+    announcer: bool = False, is_admin: bool = False
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="Расписание", callback_data=MENU_SCHEDULE)
+    builder.button(text="Сегодня", callback_data=MENU_TODAY)
+    builder.button(text="Завтра", callback_data=MENU_TOMORROW)
+    builder.button(text="📅 Неделя", callback_data=MENU_WEEK)
+    builder.button(text="Чужое расписание", callback_data=MENU_FOREIGN)
+    builder.button(text="📄 PDF расписания", callback_data=MENU_PDF)
+    builder.button(text="Настройки", callback_data=MENU_SETTINGS)
+    widths = [2, 2, 2]
+    if announcer:
+        builder.button(text="📢 Объявление", callback_data=MENU_ANNOUNCE)
+        widths.append(1)
+    if is_admin:
+        builder.button(text="⚙️ Админ-панель", callback_data=MENU_ADMIN)
+        widths.append(1)
+    builder.adjust(*widths)
+    return builder.as_markup()
+
+
+def main_menu_for_user(telegram_id: int) -> InlineKeyboardMarkup:
+    """Главное меню с учётом ролей пользователя."""
+    return main_menu_markup(
+        announcer=is_announcer(telegram_id), is_admin=is_admin(telegram_id)
+    )
+
+
+def admin_markup() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📊 Статистика", callback_data=ADMIN_STATS)
+    builder.button(text="📣 Рассылка", callback_data=ADMIN_BROADCAST)
+    builder.button(text="👥 Роли", callback_data=ADMIN_ROLES)
+    builder.button(text="🔄 Обновить расписание", callback_data=ADMIN_UPDATE)
+    builder.button(text="🏠 В главное меню", callback_data=MENU_HOME)
+    builder.adjust(2, 2, 1)
+    return builder.as_markup()
+
+
+def stats_markup() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="← Назад", callback_data=ADMIN_BACK)
+    builder.button(text="🏠 В главное меню", callback_data=MENU_HOME)
+    builder.adjust(2)
+    return builder.as_markup()
+
+
+def admin_text() -> str:
+    return "⚙️ <b>Админ-панель</b>\nУправление ботом и пользователями."
+
+
+def settings_markup() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⚙️ Изменение группы", callback_data=SETTINGS_GROUP)
+    builder.button(text="← Назад", callback_data=MENU_HOME)
     builder.adjust(1)
     return builder.as_markup()
 
@@ -255,19 +412,62 @@ def schedule_text(group: str, week: str, day: str) -> str:
     return "\n".join(lines)
 
 
-def schedule_markup(week: str, day: str) -> InlineKeyboardMarkup:
+def schedule_markup(week: str, day: str, group: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(
         text=f"{WEEK_EMOJI[week]} {WEEK_LABELS[week]}",
-        callback_data=f"{MENU_TOGGLE}:{week}:{day}",
+        callback_data=f"{MENU_TOGGLE}:{week}:{day}:{group}",
     )
     for day_name in WEEK_DAYS:
         marker = "• " if day_name == day else ""
         builder.button(
             text=f"{marker}{DAY_SHORT[day_name]}",
-            callback_data=f"{MENU_DAY}:{week}:{day_name}",
+            callback_data=f"{MENU_DAY}:{week}:{day_name}:{group}",
         )
-    builder.button(text="🏠 В главное меню", callback_data=MENU_HOME)
+    builder.button(text="📅 Неделя", callback_data=f"{MENU_WEEK}:{week}:{group}")
+    builder.button(text="← Назад", callback_data=MENU_HOME)
+    builder.adjust(1, 3, 3, 1, 1)
+    return builder.as_markup()
+
+
+def week_text(group: str, week: str) -> str:
+    """Расписание на всю неделю компактно (без преподавателей и аудиторий)."""
+    lines = [
+        f"📅 <b>Неделя</b> · {week_label(week)}\n"
+        f"Группа: <b>{escape(group)}</b>"
+    ]
+    for day in WEEK_DAYS:
+        lessons = db.get_lessons_for_group(group, week, day)
+        lines.append(f"\n<b>{day}</b> ({DAY_SHORT[day]}):")
+        if not lessons:
+            lines.append("   Нет занятий.")
+            continue
+        for i, lesson in enumerate(lessons, start=1):
+            parts = [f"<b>{escape(lesson['time'])}</b>"]
+            if lesson["lesson_type"]:
+                parts.append(_short_lesson_type(lesson["lesson_type"]))
+            lines.append(
+                f"   {i}. {' · '.join(parts)} — {escape(_nice_discipline(lesson['discipline']))}"
+            )
+    text = "\n".join(lines)
+    if len(text) > 3600:
+        text = text[:3600].rstrip() + "\n\n… (показано не всё)"
+    return text
+
+
+def week_markup(week: str, group: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    other_week = "н" if week == "в" else "в"
+    builder.button(
+        text=f"Показать {week_label(other_week)}",
+        callback_data=f"{MENU_WEEK}:{other_week}:{group}",
+    )
+    for day_name in WEEK_DAYS:
+        builder.button(
+            text=DAY_SHORT[day_name],
+            callback_data=f"{MENU_DAY}:{week}:{day_name}:{group}",
+        )
+    builder.button(text="← Назад", callback_data=MENU_HOME)
     builder.adjust(1, 3, 3, 1)
     return builder.as_markup()
 
@@ -278,7 +478,8 @@ async def apply_schedule_view(
     toast = f"{DAY_SHORT.get(day, day)} · {week_label(week)}"
     try:
         await callback.message.edit_text(
-            schedule_text(group, week, day), reply_markup=schedule_markup(week, day)
+            schedule_text(group, week, day),
+            reply_markup=schedule_markup(week, day, group),
         )
     except TelegramBadRequest as exc:
         if "not modified" in str(exc):
@@ -298,14 +499,35 @@ def _user_group(callback: CallbackQuery) -> str | None:
     return user.group_name
 
 
+def user_role_level(telegram_id: int) -> int:
+    """Числовой уровень роли: SUPERUSER > ADMIN > TEACHER/TRUSTED > STUDENT."""
+    if telegram_id in Config().admin_ids():
+        return UserRole.level(UserRole.SUPERUSER)
+    user = db.get_user(telegram_id)
+    if user is None:
+        return -1
+    return UserRole.level(user.role)
+
+
+def is_admin(telegram_id: int) -> bool:
+    return user_role_level(telegram_id) >= UserRole.level(UserRole.ADMIN)
+
+
+def is_announcer(telegram_id: int) -> bool:
+    """Староста/преподаватель: может слать объявления."""
+    return user_role_level(telegram_id) >= UserRole.level(UserRole.TEACHER)
+
+
 @router.message(CommandStart())
-async def cmd_start(message: Message) -> None:
+async def cmd_start(message: Message, state: FSMContext | None = None) -> None:
+    if state is not None:
+        await state.clear()
     telegram_id = message.from_user.id
     user = db.get_user(telegram_id)
 
     if user is not None and user.group_name:
         await message.answer(
-            main_menu_text(user.group_name), reply_markup=main_menu_markup()
+            main_menu_text(user.group_name), reply_markup=main_menu_for_user(telegram_id)
         )
         return
 
@@ -372,7 +594,7 @@ async def on_confirm_registration(callback: CallbackQuery) -> None:
 
     await callback.message.answer(
         main_menu_text(group, registered=True),
-        reply_markup=main_menu_markup(),
+        reply_markup=main_menu_for_user(telegram_id),
     )
 
 
@@ -400,43 +622,69 @@ async def on_back_to_courses(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
-@router.callback_query(F.data == MENU_SCHEDULE)
+@router.callback_query(F.data.in_({MENU_SCHEDULE, MENU_TODAY}))
 async def on_menu_schedule(callback: CallbackQuery) -> None:
+    """Кнопка «Сегодня» (и легаси «Расписание»): панель на текущую дату."""
     group = _user_group(callback)
     if group is None:
         await callback.answer("Сначала выбери группу", show_alert=True)
         return
-    await apply_schedule_view(callback, group, current_week(), current_day())
+    await apply_schedule_view(callback, group, *view_day())
+
+
+@router.callback_query(F.data == MENU_TOMORROW)
+async def on_menu_tomorrow(callback: CallbackQuery) -> None:
+    group = _user_group(callback)
+    if group is None:
+        await callback.answer("Сначала выбери группу", show_alert=True)
+        return
+    await apply_schedule_view(callback, group, *view_day(days_offset=1))
+
+
+def _panel_group_from_data(payload: str) -> tuple[str, str, str | None]:
+    """Разбирает payload панели на (week, day, group|None).
+
+    Формат: '{week}:{day}' — своя группа (легаси), '{week}:{day}:{group}' — чужая.
+    """
+    parts = payload.split(":")
+    if len(parts) < 2:
+        return ("", "", None)
+    week, day = parts[0], parts[1]
+    if week not in WEEK_LABELS or day not in DAY_SHORT:
+        return ("", "", None)
+    group = ":".join(parts[2:]) if len(parts) > 2 else None
+    return (week, day, group or None)
 
 
 @router.callback_query(F.data.startswith(f"{MENU_DAY}:"))
 async def on_menu_day(callback: CallbackQuery) -> None:
-    group = _user_group(callback)
+    week, day, group = _panel_group_from_data(
+        callback.data.removeprefix(f"{MENU_DAY}:")
+    )
+    if not week:
+        await callback.answer()
+        return
     if group is None:
-        await callback.answer("Сначала выбери группу", show_alert=True)
-        return
-    try:
-        _, _, week, day = callback.data.split(":")
-    except ValueError:
-        await callback.answer()
-        return
-    if week not in WEEK_LABELS or day not in DAY_SHORT:
-        await callback.answer()
-        return
+        group = _user_group(callback)
+        if group is None:
+            await callback.answer("Сначала выбери группу", show_alert=True)
+            return
     await apply_schedule_view(callback, group, week, day)
 
 
 @router.callback_query(F.data.startswith(f"{MENU_TOGGLE}:"))
 async def on_menu_toggle(callback: CallbackQuery) -> None:
-    group = _user_group(callback)
-    if group is None:
-        await callback.answer("Сначала выбери группу", show_alert=True)
-        return
-    try:
-        _, _, week, day = callback.data.split(":")
-    except ValueError:
+    week, day, group = _panel_group_from_data(
+        callback.data.removeprefix(f"{MENU_TOGGLE}:")
+    )
+    if not week:
         await callback.answer()
         return
+    if group is None:
+        group = _user_group(callback)
+        if group is None:
+            await callback.answer("Сначала выбери группу", show_alert=True)
+            return
     other_week = "н" if week == "в" else "в"
     await apply_schedule_view(callback, group, other_week, day)
 
@@ -449,9 +697,640 @@ async def on_menu_home(callback: CallbackQuery) -> None:
         await callback.answer()
         return
     await callback.message.edit_text(
-        main_menu_text(group), reply_markup=main_menu_markup()
+        main_menu_text(group), reply_markup=main_menu_for_user(callback.from_user.id)
     )
     await callback.answer()
+
+
+@router.callback_query(F.data == MENU_SETTINGS)
+async def on_menu_settings(callback: CallbackQuery) -> None:
+    group = _user_group(callback)
+    header = "⚙️ <b>Настройки</b>"
+    if group:
+        header += f"\nГруппа: <b>{escape(group)}</b>"
+    await callback.message.edit_text(header, reply_markup=settings_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data == SETTINGS_GROUP)
+async def on_settings_change_group(callback: CallbackQuery) -> None:
+    await callback.message.edit_text(
+        "📚 <b>Выбери курс</b>\nСмена группы — выбери свой курс:",
+        reply_markup=courses_keyboard(prefix=SG_COURSE_PREFIX, back=MENU_SETTINGS),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == SG_BACK)
+async def on_sg_back(callback: CallbackQuery) -> None:
+    await on_settings_change_group(callback)
+
+
+@router.callback_query(F.data.startswith(SG_COURSE_PREFIX))
+async def on_sg_course(callback: CallbackQuery) -> None:
+    try:
+        course = int(callback.data.removeprefix(SG_COURSE_PREFIX))
+    except ValueError:
+        await callback.answer("Неверный курс", show_alert=True)
+        return
+
+    keyboard = groups_keyboard(course, prefix=SG_GROUP_PREFIX, back=SG_BACK)
+    if keyboard is None:
+        await callback.message.edit_text(
+            f"😕 Для курса {course} пока нет расписания.\n\nВыбери другой курс:",
+            reply_markup=courses_keyboard(prefix=SG_COURSE_PREFIX, back=MENU_SETTINGS),
+        )
+    else:
+        await callback.message.edit_text(
+            f"📚 <b>Курс {course}</b>\nВыбери свою группу:", reply_markup=keyboard
+        )
+    await callback.answer(f"Курс {course}")
+
+
+@router.callback_query(F.data.startswith(SG_GROUP_PREFIX))
+async def on_sg_group(callback: CallbackQuery) -> None:
+    group = callback.data.removeprefix(SG_GROUP_PREFIX)
+    course = db.get_course_by_group(group)
+    if course is None:
+        await callback.answer("Группа не найдена", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        "✍️ <b>Изменение группы</b>\n\n"
+        f"Группа: <b>{escape(group)}</b>\n"
+        f"Курс: {course}\n\n"
+        "Подтверди смену группы:",
+        reply_markup=sg_confirm_keyboard(course, group),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith(SG_CONFIRM_PREFIX))
+async def on_sg_confirm(callback: CallbackQuery) -> None:
+    telegram_id = callback.from_user.id
+    group = callback.data.removeprefix(SG_CONFIRM_PREFIX)
+
+    user = db.update_user_group(telegram_id, group)
+    if user is None:
+        await callback.answer("Ты ещё не зарегистрирован. Нажми /start", show_alert=True)
+        return
+    db.log_action(telegram_id, "change_group", group)
+    logger.info("Группа изменена: %s -> %s", telegram_id, group)
+
+    await callback.message.edit_text(
+        main_menu_text(group), reply_markup=main_menu_for_user(telegram_id)
+    )
+    await callback.answer("Группа изменена")
+
+
+@router.callback_query(F.data.startswith(SG_CANCEL_PREFIX))
+async def on_sg_cancel(callback: CallbackQuery) -> None:
+    try:
+        course = int(callback.data.removeprefix(SG_CANCEL_PREFIX))
+    except ValueError:
+        course = None
+
+    if course is not None:
+        keyboard = groups_keyboard(course, prefix=SG_GROUP_PREFIX, back=SG_BACK)
+        if keyboard is None:
+            await callback.answer("Групп для курса нет", show_alert=True)
+            return
+        await callback.message.edit_text(
+            f"📚 <b>Курс {course}</b>\nВыбери свою группу:", reply_markup=keyboard
+        )
+        await callback.answer()
+        return
+
+    await callback.message.edit_text("⚙️ <b>Настройки</b>", reply_markup=settings_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data == MENU_FOREIGN)
+async def on_menu_foreign(callback: CallbackQuery) -> None:
+    await callback.message.edit_text(
+        "👀 <b>Чужое расписание</b>\nВыбери курс:",
+        reply_markup=courses_keyboard(prefix=V_COURSE_PREFIX, back=MENU_HOME),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == V_BACK)
+async def on_v_back(callback: CallbackQuery) -> None:
+    await on_menu_foreign(callback)
+
+
+@router.callback_query(F.data.startswith(V_COURSE_PREFIX))
+async def on_v_course(callback: CallbackQuery) -> None:
+    try:
+        course = int(callback.data.removeprefix(V_COURSE_PREFIX))
+    except ValueError:
+        await callback.answer("Неверный курс", show_alert=True)
+        return
+
+    keyboard = groups_keyboard(course, prefix=V_GROUP_PREFIX, back=V_BACK)
+    if keyboard is None:
+        await callback.message.edit_text(
+            f"😕 Для курса {course} пока нет расписания.\n\nВыбери другой курс:",
+            reply_markup=courses_keyboard(prefix=V_COURSE_PREFIX, back=MENU_HOME),
+        )
+    else:
+        await callback.message.edit_text(
+            f"📚 <b>Курс {course}</b>\nВыбери группу:", reply_markup=keyboard
+        )
+    await callback.answer(f"Курс {course}")
+
+
+@router.callback_query(F.data.startswith(V_GROUP_PREFIX))
+async def on_v_group(callback: CallbackQuery) -> None:
+    group = callback.data.removeprefix(V_GROUP_PREFIX)
+    course = db.get_course_by_group(group)
+    if course is None:
+        await callback.answer("Группа не найдена", show_alert=True)
+        return
+
+    await apply_schedule_view(callback, group, *view_day())
+    db.log_action(callback.from_user.id, "view_foreign", group)
+
+
+async def _show_week(callback: CallbackQuery, group: str, week: str) -> None:
+    try:
+        await callback.message.edit_text(
+            week_text(group, week), reply_markup=week_markup(week, group)
+        )
+    except TelegramBadRequest as exc:
+        if "not modified" in str(exc):
+            await callback.answer(f"{week_label(week)} — уже открыто")
+            return
+        logger.warning("Не удалось показать неделю: %s", exc)
+    await callback.answer(f"{week_label(week)} неделя")
+
+
+@router.callback_query(F.data == MENU_WEEK)
+async def on_menu_week_now(callback: CallbackQuery) -> None:
+    """«📅 Неделя» из главного меню: текущая неделя своей группы."""
+    group = _user_group(callback)
+    if group is None:
+        await callback.answer("Сначала выбери группу", show_alert=True)
+        return
+    week, _ = view_day()
+    await _show_week(callback, group, week)
+
+
+@router.callback_query(F.data.startswith(f"{MENU_WEEK}:"))
+async def on_menu_week(callback: CallbackQuery) -> None:
+    payload = callback.data.removeprefix(f"{MENU_WEEK}:")
+    parts = payload.split(":", 1)
+    week = parts[0]
+    group = parts[1] if len(parts) > 1 else None
+    if week not in WEEK_LABELS:
+        await callback.answer()
+        return
+    if not group:
+        group = _user_group(callback)
+        if group is None:
+            await callback.answer("Сначала выбери группу", show_alert=True)
+            return
+    await _show_week(callback, group, week)
+
+
+def _pdf_document(course: int) -> FSInputFile | None:
+    record = db.get_file_for_course(course)
+    if record is None:
+        return None
+    path = Path(Config().download_dir()) / record.name
+    if not path.exists():
+        logger.warning("Файл расписания %s отсутствует на диске", path)
+        return None
+    return FSInputFile(path)
+
+
+@router.callback_query(F.data == MENU_PDF)
+async def on_menu_pdf(callback: CallbackQuery) -> None:
+    group = _user_group(callback)
+    if group is None:
+        await callback.answer("Сначала выбери группу", show_alert=True)
+        return
+    course = db.get_course_by_group(group)
+    if course is None:
+        await callback.answer("Курс не найден", show_alert=True)
+        return
+    document = _pdf_document(course)
+    if document is None:
+        await callback.answer("PDF ещё не готов — попробуй позже", show_alert=True)
+        return
+    await callback.answer("Отправляю файл…")
+    await callback.bot.send_document(
+        chat_id=callback.from_user.id,
+        document=document,
+        caption=f"📄 Расписание {course}-го курса",
+    )
+    db.log_action(callback.from_user.id, "pdf", str(course))
+
+
+def _target_label(target: int | str | None) -> str:
+    if target is None:
+        return "все пользователи"
+    if isinstance(target, int):
+        return f"{target} курс"
+    return target
+
+
+def _broadcast_audience_markup() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="👥 Все пользователи", callback_data=f"{BROADCAST_AUD_PREFIX}all"
+    )
+    for course in db.list_courses():
+        builder.button(
+            text=f"{course} курс", callback_data=f"{BROADCAST_AUD_PREFIX}course:{course}"
+        )
+    builder.button(text="← Назад", callback_data=ADMIN_BACK)
+    builder.adjust(2, 1)
+    return builder.as_markup()
+
+
+def _confirm_markup(ok_data: str, redo_data: str, cancel_data: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Отправить", callback_data=ok_data)
+    builder.button(text="🔄 Заново", callback_data=redo_data)
+    builder.button(text="❌ Отмена", callback_data=cancel_data)
+    builder.adjust(1, 2)
+    return builder.as_markup()
+
+
+@router.callback_query(F.data == MENU_ADMIN)
+async def on_menu_admin(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа к админ-панели", show_alert=True)
+        return
+    await callback.message.edit_text(admin_text(), reply_markup=admin_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data == ADMIN_BACK)
+async def on_admin_back(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    await callback.message.edit_text(admin_text(), reply_markup=admin_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data == ADMIN_STATS)
+async def on_admin_stats(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    courses = db.list_courses()
+    per_course = db.users_by_course_counts()
+    actions = db.action_stats(days=30)
+    lines = ["📊 <b>Статистика</b>", ""]
+    lines.append(f"Всего пользователей: {db.count_total_users()}")
+    lines.append(f"Активных за 30 дней: {db.count_active_users()}")
+    lines.append("По курсам:")
+    for course in courses:
+        lines.append(f"  • {course} курс: {per_course.get(course, 0)}")
+    lines.append("Действия за 30 дней:")
+    if actions:
+        for action, count in sorted(actions.items(), key=lambda kv: -kv[1]):
+            lines.append(f"  • {action}: {count}")
+    else:
+        lines.append("  пока нет")
+    await callback.message.edit_text("\n".join(lines), reply_markup=stats_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data == ADMIN_BROADCAST)
+async def on_admin_broadcast(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "📣 <b>Рассылка</b>\nКому отправить?",
+        reply_markup=_broadcast_audience_markup(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith(BROADCAST_AUD_PREFIX))
+async def on_broadcast_audience(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    raw = callback.data.removeprefix(BROADCAST_AUD_PREFIX)
+    if raw == "all":
+        target = None
+    elif raw.startswith("course:"):
+        try:
+            target = int(raw.split(":")[1])
+        except ValueError:
+            await callback.answer("Неверный курс", show_alert=True)
+            return
+    else:
+        target = None
+    await state.set_state(BroadcastStates.text)
+    await state.update_data(target=target, origin="admin")
+    await callback.message.edit_text(
+        f"📣 Аудитория: <b>{_target_label(target)}</b>\n\n"
+        "Отправь текст сообщения. Для отмены — /start.",
+    )
+    await callback.answer()
+
+
+@router.message(BroadcastStates.text)
+async def on_broadcast_text(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        await message.answer("Нет доступа")
+        return
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Текст не может быть пустым — пришли сообщение ещё раз. Для отмены — /start.")
+        return
+    text = escape(text)
+    await state.update_data(text=text)
+    data = await state.get_data()
+    await message.answer(
+        f"📣 <b>Подтверждение рассылки</b>\n\n"
+        f"Аудитория: <b>{_target_label(data.get('target'))}</b>\n\n"
+        f"{text}\n\nОтправить?",
+        reply_markup=_confirm_markup(
+            BROADCAST_CONFIRM, BROADCAST_REDO, BROADCAST_CANCEL
+        ),
+    )
+
+
+@router.callback_query(F.data == BROADCAST_CONFIRM)
+async def on_broadcast_confirm(
+    callback: CallbackQuery, state: FSMContext, bot: Bot
+) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    data = await state.get_data()
+    target = data.get("target")
+    text = data.get("text") or ""
+    await state.clear()
+    users = db.list_users_for_broadcast(target)
+    await callback.message.edit_text(
+        f"📣 Рассылка запущена: {len(users)} получателей…"
+    )
+    sent = await send_to_users(bot, users, text)
+    db.log_action(
+        callback.from_user.id, "broadcast", f"{_target_label(target)}: {sent}/{len(users)}"
+    )
+    await callback.message.edit_text(f"✅ Отправлено {sent} из {len(users)}")
+    await callback.answer("Расслылка отправлена")
+
+
+@router.callback_query(F.data == BROADCAST_REDO)
+async def on_broadcast_redo(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    data = await state.get_data()
+    target = data.get("target")
+    await state.set_state(BroadcastStates.text)
+    await callback.message.edit_text(
+        f"📣 Аудитория: <b>{_target_label(target)}</b>\n\nОтправь текст ещё раз:"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == BROADCAST_CANCEL)
+async def on_broadcast_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await callback.message.edit_text(admin_text(), reply_markup=admin_markup())
+    await callback.answer("Отменено")
+
+
+@router.callback_query(F.data == ADMIN_ROLES)
+async def on_admin_roles(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.set_state(RoleStates.query)
+    await callback.message.edit_text(
+        "👥 <b>Роли</b>\nВведи telegram id, @username или имя — найду пользователя:",
+    )
+    await callback.answer()
+
+
+@router.message(RoleStates.query)
+async def on_roles_query(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        await message.answer("Нет доступа")
+        return
+    query = (message.text or "").strip()
+    if not query:
+        await message.answer("Пустой запрос — введи что-нибудь или нажми /start.")
+        return
+    users = db.search_users(query, limit=30)
+    if not users:
+        await message.answer("Никого не нашёл. Попробуй другой запрос или /start.")
+        return
+    builder = InlineKeyboardBuilder()
+    for user in users:
+        label = f"{user.telegram_id} · {user.first_name or ''} {user.last_name or ''}".strip()
+        if user.group_name:
+            label += f" · {user.group_name}"
+        builder.button(text=label, callback_data=f"{ADMIN_ROLE_PICK_PREFIX}{user.telegram_id}")
+    builder.button(text="← Назад", callback_data=ADMIN_BACK)
+    builder.adjust(1)
+    await message.answer("Найденные пользователи:", reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data.startswith(ADMIN_ROLE_PICK_PREFIX))
+async def on_admin_role_pick(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        telegram_id = int(callback.data.removeprefix(ADMIN_ROLE_PICK_PREFIX))
+    except ValueError:
+        await callback.answer("Некорректный id", show_alert=True)
+        return
+    user = db.get_user(telegram_id)
+    if user is None:
+        await callback.answer("Пользователь не найден", show_alert=True)
+        return
+    await state.set_state(RoleStates.query)
+    await state.update_data(role_user_id=telegram_id)
+    builder = InlineKeyboardBuilder()
+    for role in (UserRole.STUDENT, UserRole.TEACHER, UserRole.TRUSTED, UserRole.ADMIN, UserRole.SUPERUSER):
+        builder.button(
+            text=UserRole.label(role),
+            callback_data=f"{ADMIN_ROLE_SET_PREFIX}{telegram_id}:{role}",
+        )
+    builder.button(text="← Назад", callback_data=ADMIN_ROLES)
+    builder.adjust(2)
+    name = f"{user.first_name or ''} {user.last_name or ''}".strip() or str(telegram_id)
+    await callback.message.edit_text(
+        f"👥 <b>Роль</b>\nПользователь: <b>{escape(name)}</b>\n"
+        f"Текущая роль: {UserRole.label(user.role)}\n\nВыбери новую:",
+        reply_markup=builder.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith(ADMIN_ROLE_SET_PREFIX))
+async def on_admin_role_set(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    payload = callback.data.removeprefix(ADMIN_ROLE_SET_PREFIX)
+    telegram_id_str, role = payload.split(":", 1)
+    try:
+        telegram_id = int(telegram_id_str)
+    except ValueError:
+        await callback.answer("Некорректный id", show_alert=True)
+        return
+    result = db.set_role(telegram_id, role)
+    await state.clear()
+    if not result:
+        await callback.answer("Пользователь не найден", show_alert=True)
+        return
+    db.log_action(callback.from_user.id, "set_role", f"{telegram_id}:{role}")
+    await callback.message.edit_text(
+        f"✅ Роль пользователя {telegram_id}: <b>{UserRole.label(role)}</b>",
+        reply_markup=admin_markup(),
+    )
+    await callback.answer("Роль обновлена")
+
+
+@router.callback_query(F.data == ADMIN_UPDATE)
+async def on_admin_update(callback: CallbackQuery, bot: Bot) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    asyncio.create_task(update_schedule_once(bot))
+    await callback.answer("Обновление расписания запущено")
+
+
+def _announce_audience_markup(user_course: int | None) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    if user_course is not None:
+        builder.button(
+            text=f"Мой курс ({user_course})",
+            callback_data=f"{ANNOUNCE_AUD_PREFIX}course:{user_course}",
+        )
+    builder.button(
+        text="Все курсы", callback_data=f"{ANNOUNCE_AUD_PREFIX}all"
+    )
+    builder.button(text="← Назад", callback_data=MENU_HOME)
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+@router.callback_query(F.data == MENU_ANNOUNCE)
+async def on_menu_announce(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_announcer(callback.from_user.id):
+        await callback.answer("Нет доступа к объявлениям", show_alert=True)
+        return
+    user_course = None
+    group = _user_group(callback)
+    if group is not None:
+        user_course = db.get_course_by_group(group)
+    await callback.message.edit_text(
+        "📢 <b>Объявление</b>\nКуда отправить?",
+        reply_markup=_announce_audience_markup(user_course),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith(ANNOUNCE_AUD_PREFIX))
+async def on_announce_audience(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_announcer(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    raw = callback.data.removeprefix(ANNOUNCE_AUD_PREFIX)
+    if raw.startswith("course:"):
+        try:
+            target = int(raw.split(":")[1])
+        except ValueError:
+            await callback.answer("Неверный курс", show_alert=True)
+            return
+    else:
+        target = None
+    await state.set_state(AnnounceStates.text)
+    await state.update_data(target=target, origin="announce")
+    await callback.message.edit_text(
+        f"📢 Аудитория: <b>{_target_label(target)}</b>\n\n"
+        "Отправь текст объявления. Для отмены — /start.",
+    )
+    await callback.answer()
+
+
+@router.message(AnnounceStates.text)
+async def on_announce_text(message: Message, state: FSMContext) -> None:
+    if not is_announcer(message.from_user.id):
+        await state.clear()
+        await message.answer("Нет доступа")
+        return
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Текст не может быть пустым — пришли сообщение ещё раз. Для отмены — /start.")
+        return
+    text = escape(text)
+    await state.update_data(text=text)
+    data = await state.get_data()
+    await message.answer(
+        f"📢 <b>Подтверждение объявления</b>\n\n"
+        f"Аудитория: <b>{_target_label(data.get('target'))}</b>\n\n"
+        f"{text}\n\nОтправить?",
+        reply_markup=_confirm_markup(
+            ANNOUNCE_CONFIRM, ANNOUNCE_REDO, ANNOUNCE_CANCEL
+        ),
+    )
+
+
+@router.callback_query(F.data == ANNOUNCE_CONFIRM)
+async def on_announce_confirm(
+    callback: CallbackQuery, state: FSMContext, bot: Bot
+) -> None:
+    if not is_announcer(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    data = await state.get_data()
+    target = data.get("target")
+    text = data.get("text") or ""
+    await state.clear()
+    users = db.list_users_for_broadcast(target)
+    await callback.message.edit_text(
+        f"📢 Объявление отправляется: {len(users)} получателей…"
+    )
+    sent = await send_to_users(bot, users, text)
+    db.log_action(
+        callback.from_user.id, "announce", f"{_target_label(target)}: {sent}/{len(users)}"
+    )
+    await callback.message.edit_text(f"✅ Отправлено {sent} из {len(users)}")
+    await callback.answer("Объявление отправлено")
+
+
+@router.callback_query(F.data == ANNOUNCE_REDO)
+async def on_announce_redo(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_announcer(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    data = await state.get_data()
+    target = data.get("target")
+    await state.set_state(AnnounceStates.text)
+    await callback.message.edit_text(
+        f"📢 Аудитория: <b>{_target_label(target)}</b>\n\nОтправь текст ещё раз:"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == ANNOUNCE_CANCEL)
+async def on_announce_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await callback.message.edit_text(
+        "📋 <b>Главное меню</b>",
+        reply_markup=main_menu_for_user(callback.from_user.id),
+    )
+    await callback.answer("Отменено")
 
 
 @router.callback_query()
@@ -461,11 +1340,66 @@ async def on_unknown_callback(callback: CallbackQuery) -> None:
     await callback.answer("Эта кнопка устарела, нажми /start", show_alert=False)
 
 
-async def update_schedule_once() -> None:
+def _groups_part(groups: list[str] | None, limit: int = 6) -> str:
+    """Строка «Группы с изменениями: …» или пустая, если списка нет."""
+    if not groups:
+        return ""
+    shown = groups[:limit]
+    tail = f" и ещё {len(groups) - limit}" if len(groups) > limit else ""
+    return "\nГруппы с изменениями: " + ", ".join(shown) + tail
+
+
+async def send_to_users(bot: Bot, users, text: str) -> int:
+    """Отправляет text каждому пользователю из списка, возвращает число успехов."""
+    sent = 0
+    for user in users:
+        try:
+            await bot.send_message(user.telegram_id, text)
+            sent += 1
+        except (TelegramForbiddenError, TelegramNotFound) as exc:
+            logger.info("Пользователь %s недоступен: %s", user.telegram_id, exc)
+        except TelegramRetryAfter as exc:
+            await asyncio.sleep(exc.retry_after + 1)
+            try:
+                await bot.send_message(user.telegram_id, text)
+                sent += 1
+            except TelegramAPIError as retry_exc:
+                logger.warning(
+                    "Повторная отправка %s не удалась: %s", user.telegram_id, retry_exc
+                )
+        except TelegramAPIError as exc:
+            logger.warning("Не удалось отправить %s: %s", user.telegram_id, exc)
+        await asyncio.sleep(0.05)
+    return sent
+
+
+async def notify_course_update(
+    bot: Bot, course: int, groups: list[str] | None = None
+) -> int:
+    """Уведомляет всех студентов курса о новой версии расписания.
+
+    groups — список групп, в которых есть изменения (для умного уведомления).
+    Возвращает количество успешно отправленных сообщений.
+    """
+    users = db.list_users_by_course(course)
+    text = NOTIFY_COURSE_UPDATE.format(
+        course=course, groups_part=_groups_part(sorted(groups) if groups else None)
+    )
+    sent = await send_to_users(bot, users, text)
+    logger.info(
+        "Уведомлено о новом расписании курса %d (%d групп): %d из %d",
+        course, len(groups or []), sent, len(users),
+    )
+    return sent
+
+
+async def update_schedule_once(bot: Bot | None = None) -> None:
     """Проверяет расписание в VK, скачивает новые файлы и обновляет БД.
 
     Сначала downloader сравнивает хэши и качает только изменившиеся файлы,
     затем parser перерабатывает только те версии, которые ещё не были распарсены.
+    Если передан bot и нашлись реально изменившиеся курсы, студентам этих курсов
+    рассылаются уведомления о новой версии расписания.
     """
     config = Config()
     dest_dir = config.download_dir()
@@ -481,18 +1415,31 @@ async def update_schedule_once() -> None:
         parse_report = await asyncio.to_thread(parse_schedule_files, dest_dir)
         parsed = [name for name, item in parse_report.items() if item["status"] == "parsed"]
         logger.info("Расписание обновлено: перепарсено %d файлов", len(parsed))
+
+        if bot is not None and parsed:
+            updates: dict[int, set[str]] = {}
+            for name in parsed:
+                course = parse_course_from_filename(name)
+                if course is None:
+                    continue
+                record = db.get_file(name)
+                if record is None:
+                    continue
+                updates.setdefault(course, set()).update(db.list_groups_for_file(record.id))
+            for course in sorted(updates):
+                await notify_course_update(bot, course, sorted(updates[course]))
     except Exception as exc:
         logger.error("Сбой проверки расписания: %s", exc)
 
 
-async def schedule_updates_loop() -> None:
+async def schedule_updates_loop(bot: Bot) -> None:
     """Фоновая задача: раз в UPDATE_INTERVAL_MINUTES проверяет и обновляет расписание."""
     interval_seconds = max(1, Config().update_interval_minutes()) * 60
     logger.info(
         "Фоновая проверка расписания запущена (каждые %d мин)", interval_seconds // 60
     )
     while True:
-        await update_schedule_once()
+        await update_schedule_once(bot)
         await asyncio.sleep(interval_seconds)
 
 
@@ -513,10 +1460,10 @@ async def main() -> None:
 
     db.init_db()
 
-    asyncio.create_task(schedule_updates_loop())
-
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
+
+    asyncio.create_task(schedule_updates_loop(bot))
 
     dp.message.middleware(ActionLogMiddleware())
     dp.callback_query.middleware(ActionLogMiddleware())

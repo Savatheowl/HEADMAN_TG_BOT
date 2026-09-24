@@ -2,6 +2,8 @@ import hashlib
 import logging
 import re
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -19,6 +21,7 @@ from sqlalchemy import (
     event,
     func,
     inspect,
+    or_,
     select,
     text,
 )
@@ -237,6 +240,8 @@ class Database:
         )
         event.listen(self.engine, "connect", self._on_connect)
         self.session_factory = sessionmaker(bind=self.engine, expire_on_commit=False)
+        self._lessons_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, str]]]] = {}
+        self._lessons_cache_lock = threading.RLock()
 
     @staticmethod
     def _on_connect(dbapi_connection, connection_record) -> None:
@@ -515,13 +520,121 @@ class Database:
                 .limit(1)
             )
 
+    def list_users_by_course(self, course: int) -> list[UserInfo]:
+        """Активные зарегистрированные пользователи, чьи группы относятся к курсу."""
+        groups = set(self.list_groups_by_course(course))
+        if not groups:
+            return []
+        with Session(self.engine) as session:
+            users = session.scalars(
+                select(BotUser).where(
+                    BotUser.is_active.is_(True),
+                    BotUser.group_name.is_not(None),
+                )
+            ).all()
+            return [
+                UserInfo.from_model(u)
+                for u in users
+                if u.group_name in groups
+            ]
+
+    def list_users_for_broadcast(self, target: int | str | None = None) -> list[UserInfo]:
+        """Пользователи для рассылки: все / курс (int) / конкретная группа (str)."""
+        if isinstance(target, int):
+            return self.list_users_by_course(target)
+        with Session(self.engine) as session:
+            if isinstance(target, str):
+                users = session.scalars(
+                    select(BotUser).where(
+                        BotUser.is_active.is_(True),
+                        BotUser.group_name == target,
+                    )
+                ).all()
+            else:
+                users = session.scalars(
+                    select(BotUser).where(
+                        BotUser.is_active.is_(True),
+                        BotUser.group_name.is_not(None),
+                    )
+                ).all()
+            return [UserInfo.from_model(u) for u in users]
+
+    def count_users_by_course(self, course: int) -> int:
+        return len(self.list_users_by_course(course))
+
+    def users_by_course_counts(self) -> dict[int, int]:
+        return {
+            course: len(self.list_users_by_course(course))
+            for course in self.list_courses()
+        }
+
+    def search_users(self, query: str, limit: int = 30) -> list[UserInfo]:
+        """Поиск пользователей по id/username/имени/группе (для управления ролями)."""
+        q = f"%{query.strip().lower()}%"
+        with Session(self.engine) as session:
+            rows = session.execute(
+                select(BotUser)
+                .where(
+                    or_(
+                        func.cast(BotUser.telegram_id, String).like(q),
+                        func.lower(BotUser.username).like(q),
+                        func.lower(BotUser.first_name).like(q),
+                        func.lower(BotUser.last_name).like(q),
+                        func.lower(BotUser.group_name).like(q),
+                    )
+                )
+                .order_by(BotUser.username)
+                .limit(limit)
+            ).scalars().all()
+            return [UserInfo.from_model(u) for u in rows]
+
+    def list_groups_for_file(self, file_version_id: int) -> list[str]:
+        """Уникальные группы, затронутые версией файла."""
+        with Session(self.engine) as session:
+            rows = session.execute(
+                select(ScheduleLesson.group_name)
+                .where(
+                    ScheduleLesson.file_version_id == file_version_id,
+                    ScheduleLesson.group_name != "",
+                )
+                .distinct()
+                .order_by(ScheduleLesson.group_name)
+            ).scalars().all()
+            return list(rows)
+
+    def get_file_for_course(self, course: int) -> FileVersion | None:
+        """Актуальный (с максимальной версией) файл расписания курса."""
+        candidate: FileVersion | None = None
+        for record in self.list_files():
+            if parse_course_from_filename(record.name) != course:
+                continue
+            if candidate is None or record.version > candidate.version:
+                candidate = record
+        return candidate
+
     def get_lessons_for_group(
         self, group_name: str, week: str, day_of_week: str
     ) -> list[dict[str, str]]:
         """Занятия группы на день и неделю, отсортированные по времени.
 
+        Результат кэшируется на CACHE_TTL_SECONDS (ключ — группа+неделя+день).
         Строки с пустой дисциплиной (артефакты PDF) пропускаются.
         """
+        ttl = Config().cache_ttl_seconds()
+        key = (group_name, week, day_of_week)
+        now = time.time()
+        with self._lessons_cache_lock:
+            hit = self._lessons_cache.get(key)
+            if hit is not None and hit[0] > now:
+                return [dict(row) for row in hit[1]]
+        lessons = self._load_lessons_for_group(group_name, week, day_of_week)
+        with self._lessons_cache_lock:
+            self._lessons_cache[key] = (now + ttl, lessons)
+            return [dict(row) for row in lessons]
+
+    def _load_lessons_for_group(
+        self, group_name: str, week: str, day_of_week: str
+    ) -> list[dict[str, str]]:
         with Session(self.engine) as session:
             rows = session.execute(
                 select(
@@ -549,6 +662,13 @@ class Database:
                 }
                 for time, discipline, lesson_type, audience, teacher in rows
             ]
+
+    def invalidate_lessons_cache(self) -> None:
+        """Сбрасывает кэш расписания (вызывается после обновления БД)."""
+        with self._lessons_cache_lock:
+            self._lessons_cache.clear()
+            count = len(self._lessons_cache)
+        logger.debug("Кэш расписания сброшен (%d записей)", count)
 
     def count_total_users(self) -> int:
         with Session(self.engine) as session:
@@ -597,6 +717,7 @@ class Database:
             logger.info(
                 "Версия #%d: заменено записей расписания: %d", file_version_id, len(lessons)
             )
+            self.invalidate_lessons_cache()
             return len(lessons)
 
 

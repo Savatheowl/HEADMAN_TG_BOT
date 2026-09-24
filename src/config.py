@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -141,6 +142,15 @@ class Config:
 
     def week_parity_flip(self) -> bool:
         return self.get_bool("WEEK_PARITY_FLIP", False)
+
+    def admin_ids(self) -> list[int]:
+        """Telegram-id суперпользователей (через запятую/пробел)."""
+        raw = self.get("ADMIN_IDS", "")
+        ids: list[int] = []
+        for part in re.split(r"[\s,]+", raw.strip()):
+            if part.isdigit():
+                ids.append(int(part))
+        return ids
 
 
 if __name__ == "__main__":

@@ -4,5 +4,6 @@ __pycache__/
 .env
 *.db
 downloads/
+data/
 
 instructions/

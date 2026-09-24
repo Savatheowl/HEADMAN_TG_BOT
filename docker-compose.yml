@@ -1,0 +1,17 @@
+services:
+  headman-bot:
+    build: .
+    image: headman-bot:latest
+    container_name: headman-bot
+    restart: unless-stopped
+    init: true
+    shm_size: 1gb
+    env_file:
+      - .env
+    environment:
+      TZ: Europe/Moscow
+      DATABASE_PATH: /app/data/bot.db
+      DOWNLOAD_DIR: /app/downloads
+    volumes:
+      - ./data:/app/data
+      - ./downloads:/app/downloads

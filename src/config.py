@@ -49,6 +49,7 @@ class Config:
         "UPDATE_INTERVAL_MINUTES": 60,
         "DOWNLOAD_DIR": str(BASE_DIR / "downloads"),
         "CACHE_TTL_SECONDS": 3600,
+        "PROXY_URL": "",
     }
 
     def __init__(self, env_path: Path | str | None = None) -> None:
@@ -163,6 +164,10 @@ class Config:
             return int(raw)
         admins = self.admin_ids()
         return admins[0] if admins else None
+
+    def proxy_url(self) -> str:
+        """URL прокси для скачивания расписаний. Пусто — прямое соединение."""
+        return (self.get("PROXY_URL", self.DEFAULTS["PROXY_URL"]) or "").strip()
 
 
 if __name__ == "__main__":

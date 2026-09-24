@@ -18,6 +18,8 @@ import logging
 logging.disable(logging.CRITICAL)
 
 import bot
+import downloader
+from config import Config
 from database import Database
 
 TEST_TG_ID = 987_654_321_000
@@ -662,6 +664,100 @@ def test_19_help_command() -> None:
     print("19. Команда /help: помощь и список команд — ok")
 
 
+def test_20_downloader_retry() -> None:
+    class PageStub:
+        def __init__(self, failures: int):
+            self.failures = failures
+            self.calls = 0
+
+        async def goto(self, url: str, **kwargs) -> None:
+            self.calls += 1
+            if self.calls <= self.failures:
+                raise downloader.PlaywrightTimeoutError("таймаут")
+
+    async def scenario(failures: int, attempts: int) -> dict:
+        page = PageStub(failures)
+        try:
+            await downloader.goto_with_retry(
+                page, "https://vk.ru/topic-1", attempts=attempts,
+                delay_between=(0.0, 0.0),
+            )
+            ok = True
+        except (downloader.PlaywrightTimeoutError, downloader.PlaywrightError):
+            ok = False
+        return {"ok": ok, "calls": page.calls}
+
+    # Два падения — третья попытка успешна.
+    res = run(scenario(failures=2, attempts=3))
+    assert res["ok"] and res["calls"] == 3, res
+    # Все попытки исчерпаны — последняя ошибка проброшена.
+    res = run(scenario(failures=3, attempts=3))
+    assert not res["ok"] and res["calls"] == 3, res
+    print("20. Ретрай навигации скачивателя (провальные попытки → успех) — ok")
+
+
+def test_21_downloader_proxy_config() -> None:
+    assert downloader.proxy_config_from_url("") is None
+    assert downloader.proxy_config_from_url("   ") is None
+    assert downloader.proxy_config_from_url("socks5://1.2.3.4:1080") == {
+        "server": "socks5://1.2.3.4:1080",
+    }
+    assert downloader.proxy_config_from_url("http://user:pwd@host:8080") == {
+        "server": "http://user:pwd@host:8080",
+    }
+    # PROXY_URL пуст в .env / по умолчанию — прямое соединение.
+    assert Config().proxy_url() == ""
+    print("21. Формирование proxy-конфига из PROXY_URL — ok")
+
+
+def test_22_downloader_host_fallback() -> None:
+    class PageStub:
+        def __init__(self, fail_urls: set[str]):
+            self.fail_urls = fail_urls
+            self.visited: list[str] = []
+
+        async def goto(self, url: str, **kwargs) -> None:
+            self.visited.append(url)
+            if url in self.fail_urls:
+                raise downloader.PlaywrightTimeoutError("таймаут")
+
+        async def wait_for_selector(self, selector: str, **kwargs) -> None:
+            return None
+
+        async def eval_on_selector_all(self, selector: str, js: str) -> list[dict]:
+            return [{"href": "/doc1", "text": "Расписание 1 курс"}]
+
+    orig = downloader.goto_with_retry
+
+    async def fake_goto(page, url, **kwargs) -> None:
+        await page.goto(url)
+
+    downloader.goto_with_retry = fake_goto
+    try:
+        async def scenario(fail_urls: set[str], urls: list[str]) -> dict:
+            page = PageStub(fail_urls)
+            try:
+                links = await downloader.fetch_links_from_hosts(page, urls)
+                return {"links": links, "visited": page.visited}
+            except RuntimeError:
+                return {"links": None, "visited": page.visited}
+
+        # Аномальный (vk.ru) хост падает → фолбэк на vk.com.
+        res = run(scenario({"https://vk.ru/topic-61699714_47589048"},
+                           ["https://vk.ru/topic-61699714_47589048",
+                            "https://vk.com/topic-61699714_47589048"]))
+        assert res["visited"] == ["https://vk.ru/topic-61699714_47589048",
+                                  "https://vk.com/topic-61699714_47589048"], res
+        assert res["links"][0]["url"] == "https://vk.ru/doc1", res  # относительный href → VK_BASE
+        # Все хосты падают → RuntimeError.
+        res = run(scenario({"https://vk.ru/topic-61699714_47589048"},
+                           ["https://vk.ru/topic-61699714_47589048"]))
+        assert res["links"] is None and len(res["visited"]) == 1, res
+        print("22. Фолбэк-хосты темы (vk.ru → vk.com) — ok")
+    finally:
+        downloader.goto_with_retry = orig
+
+
 if __name__ == "__main__":
     try:
         test_01_db_and_formatters()
@@ -683,6 +779,9 @@ if __name__ == "__main__":
         test_17_announce_flow()
         test_18_report_flow()
         test_19_help_command()
+        test_20_downloader_retry()
+        test_21_downloader_proxy_config()
+        test_22_downloader_host_fallback()
         print("\nВсе проверки прошли успешно.")
     finally:
         cleanup_report_ban(TEST_TG_ID)

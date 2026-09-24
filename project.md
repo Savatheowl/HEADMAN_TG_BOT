@@ -87,7 +87,7 @@ python src/parser.py --dir downloads
 .venv/bin/python tests/test_bot.py
 ```
 
-Конфигурация — в `.env` (см. `.env.example`): `BOT_TOKEN`, `DATABASE_PATH`, `UPDATE_INTERVAL_MINUTES`, `DOWNLOAD_DIR`, `WEEK_PARITY_FLIP`, `CACHE_TTL_SECONDS`, `ADMIN_IDS` (telegram id суперпользователей через запятую/пробел), `REPORT_ADMIN_ID` (главный админ для сообщений о проблеме; если пусто — берётся первый из `ADMIN_IDS`) и др.
+Конфигурация — в `.env` (см. `.env.example`): `BOT_TOKEN`, `DATABASE_PATH`, `UPDATE_INTERVAL_MINUTES`, `DOWNLOAD_DIR`, `WEEK_PARITY_FLIP`, `CACHE_TTL_SECONDS`, `ADMIN_IDS` (telegram id суперпользователей через запятую/пробел), `REPORT_ADMIN_ID` (главный админ для сообщений о проблеме; если пусто — берётся первый из `ADMIN_IDS`), `PROXY_URL` (прокси для скачивания расписаний, если хостинг за рубежом и VK фильтрует зарубежные IP) и др.
 
 ## Деплой в Docker
 
@@ -144,4 +144,11 @@ docker compose start
 
 - **`sqlite3.OperationalError: unable to open database file`** — БД не может создаться из-за прав на запись. С именованными томами этой проблемы нет. Если в `docker-compose.yml` вернулись bind-mount'ы (`./data:/app/data`), папка на хосте должна быть доступна на запись пользователю `appuser` (uid 1000): `chown -R 1000:1000 data downloads`.
 - **`[config] .env файл не найден: /app/.env`** — безвредное предупреждение: `.env` намеренно исключён из образа (`.dockerignore`), а значения токена приходят в контейнер через `env_file` (у `src/config.py` переменные окружения имеют приоритет над файлом `.env`).
+- **VK не отдаёт расписание с зарубежного/датацентрового хоста** — симптом: в логах `Сбой проверки расписания: Page.goto: Timeout … navigating to "https://vk.ru/topic-…"`. Если с домашнего РФ-ПК страница открывается, а с сервера в Европе/US — нет, это гео-фильтрация VK. Проверка из контейнера: `docker exec headman-bot python -c "import urllib.request as u; [print(h, end=' ') or (lambda r:(print(r.status, r.geturl(), len(r.read(200)))))(u.urlopen('https://'+h+'/topic-61699714_47589048', timeout=20)) for h in ['vk.ru','vk.com','m.vk.com']]"` — если все три висят/403 → нужен RU-egress.
+
+  Встроенные меры: `src/downloader.py` пробует хосты по очереди (`TOPIC_HOSTS = ["vk.ru", "vk.com"]`) и делает до 3 попыток навигации с таймаутом 60 с. Если этого мало — включается прокси:
+  - В `docker-compose.yml` пробрасывается только `.env`, поэтому просто укажите `PROXY_URL` в `.env` на сервере: `PROXY_URL=socks5://хост:1080` (поддерживаются `socks5://` и `http://`).
+  - Дешёвый RU-egress: RU-VPS с SOCKS5 (например, `danted`), постоянный `ssh -N -D 1080` с вашего рабочего ПК в РФ (не забыть про firewall: слушать только на сервере бота), либо сервис RU/residential-прокси.
+  - После настройки: `docker compose up -d --build` → проверить в логах строку `Использую прокси для egress`.
+  - `m.vk.com` в фолбэке не используется: у него другой DOM, и текущие селекторы скачивателя на него не рассчитаны.
 - Первый запуск стартует с чистой БД: расписания скачаются сами, пользователи зарегистрируются заново.

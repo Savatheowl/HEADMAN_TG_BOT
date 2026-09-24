@@ -13,5 +13,9 @@ services:
       DATABASE_PATH: /app/data/bot.db
       DOWNLOAD_DIR: /app/downloads
     volumes:
-      - ./data:/app/data
-      - ./downloads:/app/downloads
+      - headman-data:/app/data
+      - headman-downloads:/app/downloads
+
+volumes:
+  headman-data:
+  headman-downloads:

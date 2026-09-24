@@ -101,7 +101,6 @@ git clone https://github.com/Savatheowl/HEADMAN_TG_BOT.git
 cd HEADMAN_TG_BOT
 git checkout dev
 cp .env.example .env          # вписать BOT_TOKEN и ADMIN_IDS
-mkdir -p data downloads
 docker compose up -d --build
 docker compose logs -f
 ```
@@ -112,14 +111,37 @@ docker compose logs -f
 docker compose ps             # статус
 docker compose logs -f        # логи
 docker compose restart        # перезапуск
-docker compose down           # остановка (данные в ./data и ./downloads сохраняются)
+docker compose stop           # остановка (данные в томах сохраняются)
 # обновление после git pull:
 docker compose up -d --build
 ```
 
 - `restart: unless-stopped` — бот сам поднимется после перезагрузки сервера.
 - `env_file: .env` — токен и `ADMIN_IDS` живут только в `.env` на сервере (в `.gitignore`).
-- Volume'ы `./data` и `./downloads` привязаны к папкам проекта — БД и PDF сохраняются между перезапусками, их легко бэкапить (tar этих папок + `.env`).
+- БД и PDF хранятся в именованных томах `headman-data` и `headman-downloads`: они переживают перезапуски и не зависят от прав на хостовой папке (владельца — не-root `appuser` — тома наследуют из образа при первом создании).
 - `TZ=Europe/Moscow` — обязателен: расчёт «Сегодня/Завтра/неделя» зависит от локального времени сервера.
 - `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright` в `Dockerfile` — чтобы chromium был виден не-root пользователю.
+
+Резервное копирование (тома + `.env`):
+
+```bash
+mkdir -p backup/data backup/downloads
+docker run --rm -v headman-data:/data -v "$(pwd)/backup/data:/backup" alpine sh -c 'cp -a /data/. /backup/'
+docker run --rm -v headman-downloads:/data -v "$(pwd)/backup/downloads:/backup" alpine sh -c 'cp -a /data/. /backup/'
+cp .env backup/
+```
+
+Восстановление (при остановленном боте):
+
+```bash
+docker compose stop
+docker run --rm -v "$(pwd)/backup/data:/data" -v headman-data:/backup alpine sh -c 'cp -a /data/. /backup/'
+docker run --rm -v "$(pwd)/backup/downloads:/data" -v headman-downloads:/backup alpine sh -c 'cp -a /data/. /backup/'
+docker compose start
+```
+
+### Траблшутинг
+
+- **`sqlite3.OperationalError: unable to open database file`** — БД не может создаться из-за прав на запись. С именованными томами этой проблемы нет. Если в `docker-compose.yml` вернулись bind-mount'ы (`./data:/app/data`), папка на хосте должна быть доступна на запись пользователю `appuser` (uid 1000): `chown -R 1000:1000 data downloads`.
+- **`[config] .env файл не найден: /app/.env`** — безвредное предупреждение: `.env` намеренно исключён из образа (`.dockerignore`), а значения токена приходят в контейнер через `env_file` (у `src/config.py` переменные окружения имеют приоритет над файлом `.env`).
 - Первый запуск стартует с чистой БД: расписания скачаются сами, пользователи зарегистрируются заново.

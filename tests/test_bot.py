@@ -256,7 +256,7 @@ def test_07_menu_and_view_day() -> None:
     markup = bot.main_menu_markup()
     texts = [btn.text for row in markup.inline_keyboard for btn in row]
     data = [btn.callback_data for row in markup.inline_keyboard for btn in row]
-    assert texts == ["Сегодня", "Завтра", "📅 Неделя", "Чужое расписание", "📄 PDF расписания", "Настройки"]
+    assert texts == ["🌞 Сегодня", "▶️ Завтра", "📅 Неделя", "👀 Чужое расписание", "📄 PDF расписания", "⚙️ Настройки"]
     assert data == [
         bot.MENU_TODAY, bot.MENU_TOMORROW, bot.MENU_WEEK, bot.MENU_FOREIGN,
         bot.MENU_PDF, bot.MENU_SETTINGS,
@@ -636,7 +636,7 @@ def test_18_report_flow() -> None:
 
     msg = ReportMessage("Ещё одна жалоба", TEST_TG_ID, fake_bot)
     run(bot.on_report_text(msg, state))
-    assert any("не можете" in a for a in msg.answered)
+    assert any("не можешь" in a for a in msg.answered)
     assert len(fake_bot.sent) == 1, "админу ничего не ушло после бана"
 
     os.environ["REPORT_ADMIN_ID"] = ""
@@ -648,6 +648,18 @@ def test_18_report_flow() -> None:
     del os.environ["REPORT_ADMIN_ID"]
     del os.environ["ADMIN_IDS"]
     print("18. Сообщение о проблеме: отправка админу и бан автора — ok")
+
+
+def test_19_help_command() -> None:
+    msg = FakeChatMessage("/help", uid=TEST_TG_ID)
+    run(bot.cmd_help(msg))
+    assert msg.answered
+    text = msg.answered[0]
+    assert "Что умеет этот бот" in text
+    assert "/start — открыть главное меню" in text
+    assert "/help — эта помощь" in text
+    assert bot.SHORT_DESCRIPTION_TEXT.startswith("Расписание занятий твоей группы")
+    print("19. Команда /help: помощь и список команд — ok")
 
 
 if __name__ == "__main__":
@@ -670,6 +682,7 @@ if __name__ == "__main__":
         test_16_admin_roles_flow()
         test_17_announce_flow()
         test_18_report_flow()
+        test_19_help_command()
         print("\nВсе проверки прошли успешно.")
     finally:
         cleanup_report_ban(TEST_TG_ID)

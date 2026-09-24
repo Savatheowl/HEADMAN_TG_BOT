@@ -15,10 +15,16 @@ from aiogram.exceptions import (
     TelegramNotFound,
     TelegramRetryAfter,
 )
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    BotCommand,
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardMarkup,
+    Message,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -50,10 +56,10 @@ class ActionLogMiddleware(BaseMiddleware):
 
 
 BOT_INTRO = (
-    "👋 Это бот с расписанием занятий.\n"
-    "Здесь ты сможешь смотреть актуальное расписание своей группы "
-    "и не пропускать изменения.\n\n"
-    "Для начала выбери свой курс:"
+    "👋 <b>Привет! Это бот с расписанием занятий.</b>\n\n"
+    "Здесь ты можешь смотреть актуальное расписание своей группы, "
+    "не пропускать изменения и подписываться на обновления.\n\n"
+    "Чтобы начать, выбери свой курс 👇"
 )
 
 COURSE_PREFIX = "course:"
@@ -72,13 +78,49 @@ V_BACK = "vback:courses"
 V_COURSE_PREFIX = "vcourse:"
 V_GROUP_PREFIX = "vgroup:"
 
-NO_SCHEDULE_TEXT = "⚠️ В базе пока нет расписания. Попробуйте позже."
+NO_SCHEDULE_TEXT = "⚠️ Расписания пока нет в базе. Загляни позже — подгружу его автоматически."
+
+
+def no_schedule_for_course(course: int) -> str:
+    return f"😕 Расписания для {course}-го курса пока нет.\n\nВыбери другой курс 👇"
 
 NOTIFY_COURSE_UPDATE = (
-    "📢 <b>Новая версия расписания!</b>\n\n"
-    "Для <b>{course}-го курса</b> обновилось расписание.{groups_part}\n"
+    "📢 <b>Расписание {course}-го курса обновилось!</b>\n\n"
     "Проверь, не изменилось ли что-то у твоей группы: "
-    "нажми /start и открой «Сегодня»."
+    "нажми /start и открой «🌞 Сегодня».{groups_part}"
+)
+
+HELP_TEXT = (
+    "ℹ️ <b>Что умеет этот бот</b>\n\n"
+    "• <b>🌞 Сегодня</b> и <b>▶️ Завтра</b> — расписание на день;\n"
+    "• <b>📅 Неделя</b> — расписание на всю неделю;\n"
+    "• <b>👀 Чужое расписание</b> — расписание другой группы;\n"
+    "• <b>📄 PDF расписания</b> — файл-оригинал своего курса;\n"
+    "• <b>📢 Объявления</b> — у старост и преподавателей;\n"
+    "• <b>⚙️ Настройки</b> — сменить группу или сообщить о проблеме.\n\n"
+    "Расписание обновляется автоматически, а при изменениях я пришлю уведомление.\n\n"
+    "<b>Команды:</b>\n"
+    "/start — открыть главное меню\n"
+    "/help — эта помощь"
+)
+
+DESCRIPTION_TEXT = (
+    "Это бот с расписанием занятий колледжа. В нём ты можешь смотреть расписание "
+    "своей группы на день и на неделю, переключать верхнюю и нижнюю неделю, "
+    "смотреть расписание других групп и скачивать PDF-версию расписания. "
+    "Когда расписание обновляется, бот присылает уведомление.\n\n"
+    "Если найдёшь проблему или захочешь предложить идею — напиши через "
+    "«📮 Сообщить о проблеме / предложении» в настройках или командой /start."
+)
+
+SHORT_DESCRIPTION_TEXT = (
+    "Расписание занятий твоей группы: на день, на неделю, PDF "
+    "и уведомления об изменениях."
+)
+
+ABOUT_TEXT = (
+    "Бот с расписанием занятий колледжа: день, неделя, другие группы, "
+    "PDF и уведомления о новом расписании."
 )
 
 WEEK_EMOJI = {"в": "⬛", "н": "⬜"}
@@ -213,8 +255,7 @@ async def edit_group_menu(callback: CallbackQuery, course: int, title: str) -> N
     keyboard = groups_keyboard(course)
     if keyboard is None:
         await callback.message.edit_text(
-            f"😕 Для курса {course} пока нет расписания.\n\n"
-            "Выбери другой курс:",
+            no_schedule_for_course(course),
             reply_markup=courses_keyboard(),
         )
         return
@@ -284,12 +325,12 @@ def main_menu_markup(
     announcer: bool = False, is_admin: bool = False
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="Сегодня", callback_data=MENU_TODAY)
-    builder.button(text="Завтра", callback_data=MENU_TOMORROW)
+    builder.button(text="🌞 Сегодня", callback_data=MENU_TODAY)
+    builder.button(text="▶️ Завтра", callback_data=MENU_TOMORROW)
     builder.button(text="📅 Неделя", callback_data=MENU_WEEK)
-    builder.button(text="Чужое расписание", callback_data=MENU_FOREIGN)
+    builder.button(text="👀 Чужое расписание", callback_data=MENU_FOREIGN)
     builder.button(text="📄 PDF расписания", callback_data=MENU_PDF)
-    builder.button(text="Настройки", callback_data=MENU_SETTINGS)
+    builder.button(text="⚙️ Настройки", callback_data=MENU_SETTINGS)
     widths = [2, 2, 2]
     if announcer:
         builder.button(text="📢 Объявление", callback_data=MENU_ANNOUNCE)
@@ -557,6 +598,11 @@ async def cmd_start(message: Message, state: FSMContext | None = None) -> None:
     await message.answer(BOT_INTRO, reply_markup=courses_keyboard())
 
 
+@router.message(Command("help"))
+async def cmd_help(message: Message) -> None:
+    await message.answer(HELP_TEXT)
+
+
 @router.callback_query(F.data.startswith(COURSE_PREFIX))
 async def on_course_selected(callback: CallbackQuery) -> None:
     try:
@@ -566,7 +612,7 @@ async def on_course_selected(callback: CallbackQuery) -> None:
         return
 
     await edit_group_menu(
-        callback, course, f"📚 <b>Курс {course}</b>\nВыбери свою группу:"
+        callback, course, f"📚 <b>Курс {course}</b>\nВыбери свою группу 👇"
     )
     await callback.answer(f"Курс {course}")
 
@@ -626,7 +672,7 @@ async def on_cancel_confirmation(callback: CallbackQuery) -> None:
 
     if course is not None:
         await edit_group_menu(
-            callback, course, f"📚 <b>Курс {course}</b>\nВыбери свою группу:"
+            callback, course, f"📚 <b>Курс {course}</b>\nВыбери свою группу 👇"
         )
         await callback.answer()
         return
@@ -736,7 +782,7 @@ async def on_menu_settings(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == SETTINGS_GROUP)
 async def on_settings_change_group(callback: CallbackQuery) -> None:
     await callback.message.edit_text(
-        "📚 <b>Выбери курс</b>\nСмена группы — выбери свой курс:",
+        "📚 <b>Выбери курс</b>\nСмена группы — выбери свой курс 👇",
         reply_markup=courses_keyboard(prefix=SG_COURSE_PREFIX, back=MENU_SETTINGS),
     )
     await callback.answer()
@@ -758,12 +804,12 @@ async def on_sg_course(callback: CallbackQuery) -> None:
     keyboard = groups_keyboard(course, prefix=SG_GROUP_PREFIX, back=SG_BACK)
     if keyboard is None:
         await callback.message.edit_text(
-            f"😕 Для курса {course} пока нет расписания.\n\nВыбери другой курс:",
+            f"😕 Расписания для {course}-го курса пока нет.\n\nВыбери другой курс 👇",
             reply_markup=courses_keyboard(prefix=SG_COURSE_PREFIX, back=MENU_SETTINGS),
         )
     else:
         await callback.message.edit_text(
-            f"📚 <b>Курс {course}</b>\nВыбери свою группу:", reply_markup=keyboard
+            f"📚 <b>Курс {course}</b>\nВыбери свою группу 👇", reply_markup=keyboard
         )
     await callback.answer(f"Курс {course}")
 
@@ -817,7 +863,7 @@ async def on_sg_cancel(callback: CallbackQuery) -> None:
             await callback.answer("Групп для курса нет", show_alert=True)
             return
         await callback.message.edit_text(
-            f"📚 <b>Курс {course}</b>\nВыбери свою группу:", reply_markup=keyboard
+            f"📚 <b>Курс {course}</b>\nВыбери свою группу 👇", reply_markup=keyboard
         )
         await callback.answer()
         return
@@ -842,7 +888,7 @@ def report_ban_markup(telegram_id: int) -> InlineKeyboardMarkup:
 async def on_menu_report(callback: CallbackQuery, state: FSMContext) -> None:
     if db.is_report_banned(callback.from_user.id):
         await callback.answer(
-            "Вы не можете отправлять сообщения о проблеме.", show_alert=True
+            "Ты не можешь отправлять сообщения о проблеме.", show_alert=True
         )
         return
     if Config().report_admin_id() is None:
@@ -861,7 +907,7 @@ async def on_menu_report(callback: CallbackQuery, state: FSMContext) -> None:
 async def on_report_text(message: Message, state: FSMContext) -> None:
     await state.clear()
     if db.is_report_banned(message.from_user.id):
-        await message.answer("Вы не можете отправлять сообщения о проблеме.")
+        await message.answer("Ты не можешь отправлять сообщения о проблеме.")
         return
     admin_id = Config().report_admin_id()
     if admin_id is None:
@@ -951,12 +997,12 @@ async def on_v_course(callback: CallbackQuery) -> None:
     keyboard = groups_keyboard(course, prefix=V_GROUP_PREFIX, back=V_BACK)
     if keyboard is None:
         await callback.message.edit_text(
-            f"😕 Для курса {course} пока нет расписания.\n\nВыбери другой курс:",
+            f"😕 Расписания для {course}-го курса пока нет.\n\nВыбери другой курс 👇",
             reply_markup=courses_keyboard(prefix=V_COURSE_PREFIX, back=MENU_HOME),
         )
     else:
         await callback.message.edit_text(
-            f"📚 <b>Курс {course}</b>\nВыбери группу:", reply_markup=keyboard
+            f"📚 <b>Курс {course}</b>\nВыбери свою группу 👇", reply_markup=keyboard
         )
     await callback.answer(f"Курс {course}")
 
@@ -1583,6 +1629,18 @@ async def main() -> None:
 
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
+
+    try:
+        await bot.set_my_commands(
+            [
+                BotCommand(command="start", description="Запустить бота и открыть главное меню"),
+                BotCommand(command="help", description="Помощь и список команд"),
+            ]
+        )
+        await bot.set_my_description(DESCRIPTION_TEXT)
+        await bot.set_my_short_description(SHORT_DESCRIPTION_TEXT)
+    except Exception as exc:
+        logger.warning("Не удалось зарегистрировать команды и описание бота: %s", exc)
 
     asyncio.create_task(schedule_updates_loop(bot))
 

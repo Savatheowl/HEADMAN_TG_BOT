@@ -9,6 +9,7 @@
 
 import asyncio
 from pathlib import Path
+import os
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -26,6 +27,7 @@ TEST_TG_ID4 = 987_654_321_003
 TEST_TG_ID5 = 987_654_321_004
 
 db = Database()
+db.init_db()
 
 
 class FakeUser:
@@ -124,6 +126,15 @@ def cleanup_user(uid: int) -> None:
     from sqlalchemy.orm import Session
     with Session(db.engine) as session:
         session.execute(delete(BotUser).where(BotUser.telegram_id == uid))
+        session.commit()
+
+
+def cleanup_report_ban(uid: int) -> None:
+    from sqlalchemy import delete
+    from database import ReportBan
+    from sqlalchemy.orm import Session
+    with Session(db.engine) as session:
+        session.execute(delete(ReportBan).where(ReportBan.telegram_id == uid))
         session.commit()
 
 
@@ -553,6 +564,92 @@ def test_17_announce_flow() -> None:
     print("17. Объявление старосты: курс → текст → подтверждение — ok")
 
 
+def test_18_report_flow() -> None:
+    """Сообщение о проблеме/предложении: отправка админу и бан автора."""
+
+    admin = 987_654_321_099
+    os.environ["REPORT_ADMIN_ID"] = str(admin)
+    os.environ["ADMIN_IDS"] = str(admin)
+
+    db.set_role(TEST_TG_ID5, bot.UserRole.ADMIN)
+    db.register_user(TEST_TG_ID, group_name="ИС 9-13")
+
+    def datas(markup) -> list:
+        result = []
+        for row in markup.inline_keyboard:
+            for btn in row:
+                result.append(btn.callback_data)
+        return result
+
+    cb = FakeCallback(bot.MENU_SETTINGS, uid=TEST_TG_ID)
+    run(bot.on_menu_settings(cb))
+    assert bot.MENU_REPORT in datas(cb.message.reply_markup)
+
+    state = FakeState()
+    cb = FakeCallback(bot.MENU_REPORT, uid=TEST_TG_ID)
+    run(bot.on_menu_report(cb, state))
+    assert state.current == bot.ReportStates.text
+    assert "Сообщение о проблеме" in cb.message.edited_text
+
+    class ReportBot(FakeBot):
+        def __init__(self) -> None:
+            super().__init__()
+            self.sent_markups: dict = {}
+
+        async def send_message(self, chat_id: int, text: str, reply_markup=None) -> None:
+            self.sent.append((chat_id, text))
+            self.sent_markups[chat_id] = reply_markup
+
+    class ReportMessage(FakeChatMessage):
+        def __init__(self, text: str, uid: int, bot) -> None:
+            super().__init__(text, uid)
+            self.bot = bot
+
+    fake_bot = ReportBot()
+    msg = ReportMessage("Календарь не подгружается", TEST_TG_ID, fake_bot)
+    run(bot.on_report_text(msg, state))
+    assert state.data == {}
+    assert len(fake_bot.sent) == 1 and fake_bot.sent[0][0] == admin
+    sent_text = fake_bot.sent[0][1]
+    assert "Сообщение о проблеме / предложении" in sent_text
+    assert "<b>Тест Тестов</b>" in sent_text
+    assert "@test_user" in sent_text
+    assert "ИС 9-13" in sent_text
+    assert "Время: " in sent_text
+    assert "Календарь не подгружается" in sent_text
+    assert f"{bot.REPORT_BAN_PREFIX}{TEST_TG_ID}" in datas(fake_bot.sent_markups[admin])
+    assert any("Сообщение отправлено" in a for a in msg.answered)
+
+    cb = FakeCallback(f"{bot.REPORT_BAN_PREFIX}{TEST_TG_ID}", uid=TEST_TG_ID5)
+    cb.message.text = sent_text
+    run(bot.on_report_ban(cb))
+    assert db.is_report_banned(TEST_TG_ID)
+    assert "Автор забанен" in cb.message.edited_text
+
+    cb = FakeCallback(bot.MENU_SETTINGS, uid=TEST_TG_ID)
+    run(bot.on_menu_settings(cb))
+    assert bot.MENU_REPORT not in datas(cb.message.reply_markup)
+
+    cb = FakeCallback(bot.MENU_REPORT, uid=TEST_TG_ID)
+    run(bot.on_menu_report(cb, state))
+    assert cb.toasts
+
+    msg = ReportMessage("Ещё одна жалоба", TEST_TG_ID, fake_bot)
+    run(bot.on_report_text(msg, state))
+    assert any("не можете" in a for a in msg.answered)
+    assert len(fake_bot.sent) == 1, "админу ничего не ушло после бана"
+
+    os.environ["REPORT_ADMIN_ID"] = ""
+    os.environ["ADMIN_IDS"] = ""
+    cb = FakeCallback(bot.MENU_SETTINGS, uid=TEST_TG_ID2)
+    run(bot.on_menu_settings(cb))
+    assert bot.MENU_REPORT not in datas(cb.message.reply_markup)
+
+    del os.environ["REPORT_ADMIN_ID"]
+    del os.environ["ADMIN_IDS"]
+    print("18. Сообщение о проблеме: отправка админу и бан автора — ok")
+
+
 if __name__ == "__main__":
     try:
         test_01_db_and_formatters()
@@ -572,8 +669,10 @@ if __name__ == "__main__":
         test_15_admin_broadcast()
         test_16_admin_roles_flow()
         test_17_announce_flow()
+        test_18_report_flow()
         print("\nВсе проверки прошли успешно.")
     finally:
+        cleanup_report_ban(TEST_TG_ID)
         cleanup_user(TEST_TG_ID)
         cleanup_user(TEST_TG_ID2)
         cleanup_user(TEST_TG_ID3)

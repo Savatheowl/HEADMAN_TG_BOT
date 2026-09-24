@@ -152,6 +152,18 @@ class Config:
                 ids.append(int(part))
         return ids
 
+    def report_admin_id(self) -> int | None:
+        """Telegram-id главного админа для сообщений о проблеме/предложениях.
+
+        Задаётся переменной REPORT_ADMIN_ID; если она пуста —
+        используется первый id из ADMIN_IDS.
+        """
+        raw = (self.get("REPORT_ADMIN_ID", "") or "").strip()
+        if raw.isdigit():
+            return int(raw)
+        admins = self.admin_ids()
+        return admins[0] if admins else None
+
 
 if __name__ == "__main__":
     pass

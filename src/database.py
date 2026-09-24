@@ -178,6 +178,22 @@ class UserAction(Base):
         return f"<UserAction {self.action} payload={self.payload!r}>"
 
 
+class ReportBan(Base):
+    """Бан на отправку сообщений о проблеме/предложении (ключ — telegram_id)."""
+
+    __tablename__ = "report_bans"
+
+    telegram_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, nullable=False
+    )
+    banned_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now()
+    )
+
+    def __repr__(self) -> str:
+        return f"<ReportBan {self.telegram_id} since={self.banned_at!r}>"
+
+
 @dataclass
 class UserInfo:
     """Снапшот пользователя — безопасен для использования после закрытия сессии."""
@@ -719,6 +735,20 @@ class Database:
             )
             self.invalidate_lessons_cache()
             return len(lessons)
+
+    def ban_report_user(self, telegram_id: int) -> None:
+        """Запрещает пользователю отправлять сообщения о проблеме/предложении."""
+        with Session(self.engine) as session:
+            existing = session.get(ReportBan, telegram_id)
+            if existing is None:
+                session.add(ReportBan(telegram_id=telegram_id))
+                session.commit()
+                logger.info("Пользователь %s забанен на сообщения о проблеме", telegram_id)
+
+    def is_report_banned(self, telegram_id: int) -> bool:
+        """True, если пользователь не может отправлять сообщения о проблеме."""
+        with Session(self.engine) as session:
+            return session.get(ReportBan, telegram_id) is not None
 
 
 def file_sha256(path: str | Path) -> str:

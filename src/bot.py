@@ -137,9 +137,18 @@ ANNOUNCE_CONFIRM = "announce:ok"
 ANNOUNCE_REDO = "announce:redo"
 ANNOUNCE_CANCEL = "announce:cancel"
 
+MENU_REPORT = "menu:report"
+REPORT_BAN_PREFIX = "report:ban:"
+
 
 class BroadcastStates(StatesGroup):
     """FSM ввода текста рассылки админа."""
+
+    text = State()
+
+
+class ReportStates(StatesGroup):
+    """FSM ввода текста сообщения о проблеме/предложении."""
 
     text = State()
 
@@ -322,12 +331,22 @@ def admin_text() -> str:
     return "⚙️ <b>Админ-панель</b>\nУправление ботом и пользователями."
 
 
-def settings_markup() -> InlineKeyboardMarkup:
+def settings_markup(show_report: bool = False) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="⚙️ Изменение группы", callback_data=SETTINGS_GROUP)
+    if show_report:
+        builder.button(text="📮 Сообщить о проблеме / предложении", callback_data=MENU_REPORT)
     builder.button(text="← Назад", callback_data=MENU_HOME)
-    builder.adjust(1)
+    widths = [1, 1] if show_report else [1]
+    builder.adjust(*widths)
     return builder.as_markup()
+
+
+def _report_allowed(telegram_id: int) -> bool:
+    """Может ли пользователь отправлять сообщения о проблеме/предложении."""
+    if db.is_report_banned(telegram_id):
+        return False
+    return Config().report_admin_id() is not None
 
 
 def _nice_discipline(raw: str) -> str:
@@ -708,7 +727,9 @@ async def on_menu_settings(callback: CallbackQuery) -> None:
     header = "⚙️ <b>Настройки</b>"
     if group:
         header += f"\nГруппа: <b>{escape(group)}</b>"
-    await callback.message.edit_text(header, reply_markup=settings_markup())
+    await callback.message.edit_text(
+        header, reply_markup=settings_markup(_report_allowed(callback.from_user.id))
+    )
     await callback.answer()
 
 
@@ -801,8 +822,108 @@ async def on_sg_cancel(callback: CallbackQuery) -> None:
         await callback.answer()
         return
 
-    await callback.message.edit_text("⚙️ <b>Настройки</b>", reply_markup=settings_markup())
+    await callback.message.edit_text(
+        "⚙️ <b>Настройки</b>",
+        reply_markup=settings_markup(_report_allowed(callback.from_user.id)),
+    )
     await callback.answer()
+
+
+def report_ban_markup(telegram_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="🚫 Забанить автора",
+        callback_data=f"{REPORT_BAN_PREFIX}{telegram_id}",
+    )
+    return builder.as_markup()
+
+
+@router.callback_query(F.data == MENU_REPORT)
+async def on_menu_report(callback: CallbackQuery, state: FSMContext) -> None:
+    if db.is_report_banned(callback.from_user.id):
+        await callback.answer(
+            "Вы не можете отправлять сообщения о проблеме.", show_alert=True
+        )
+        return
+    if Config().report_admin_id() is None:
+        await callback.answer("Отправка временно недоступна.", show_alert=True)
+        return
+    await state.set_state(ReportStates.text)
+    await callback.message.edit_text(
+        "📮 <b>Сообщение о проблеме / предложении</b>\n\n"
+        "Напиши одним сообщением, что случилось или что предложить. "
+        "Текст уйдёт главному админу.\n\nДля отмены — /start."
+    )
+    await callback.answer()
+
+
+@router.message(ReportStates.text)
+async def on_report_text(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    if db.is_report_banned(message.from_user.id):
+        await message.answer("Вы не можете отправлять сообщения о проблеме.")
+        return
+    admin_id = Config().report_admin_id()
+    if admin_id is None:
+        await message.answer("Отправка временно недоступна.")
+        return
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer(
+            "Сообщение не может быть пустым — напиши текст ещё раз. Для отмены — /start."
+        )
+        return
+    text = escape(text)
+
+    user = db.get_user(message.from_user.id)
+    first = message.from_user.first_name or (user.first_name if user else None)
+    last = message.from_user.last_name or (user.last_name if user else None)
+    username = message.from_user.username or (user.username if user else None)
+    full_name = " ".join(part for part in (first, last) if part) or "Без имени"
+
+    sender = f"От: <b>{escape(full_name)}</b>"
+    if username:
+        sender += f" (@{escape(username)})"
+    lines = ["📮 <b>Сообщение о проблеме / предложении</b>", "", sender]
+    if user and user.group_name:
+        lines.append(f"Группа: <b>{escape(user.group_name)}</b>")
+    lines.extend(
+        [
+            f"TG id: {message.from_user.id}",
+            f"Время: {datetime.now().strftime('%d.%m.%Y %H:%M')}",
+            "",
+            text,
+        ]
+    )
+
+    db.log_action(message.from_user.id, "report")
+    await message.bot.send_message(
+        admin_id,
+        "\n".join(lines),
+        reply_markup=report_ban_markup(message.from_user.id),
+    )
+    await message.answer("✅ Сообщение отправлено. Спасибо за обратную связь!")
+
+
+@router.callback_query(F.data.startswith(REPORT_BAN_PREFIX))
+async def on_report_ban(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    raw = callback.data.removeprefix(REPORT_BAN_PREFIX)
+    try:
+        reporter_id = int(raw)
+    except ValueError:
+        await callback.answer("Неверные данные", show_alert=True)
+        return
+    db.ban_report_user(reporter_id)
+    db.log_action(reporter_id, "report_ban", str(callback.from_user.id))
+    new_text = (
+        f"{callback.message.text}\n\n🚫 Автор забанен — новые "
+        "сообщения о проблеме от него не принимаются."
+    )
+    await callback.message.edit_text(new_text)
+    await callback.answer("Автор забанен")
 
 
 @router.callback_query(F.data == MENU_FOREIGN)
